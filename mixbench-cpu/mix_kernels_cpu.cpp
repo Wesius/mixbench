@@ -9,14 +9,34 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <vector>
 
+#ifdef USE_BLAS
+extern "C" {
+    void sgemm_(const char* transa, const char* transb,
+                const int* m, const int* n, const int* k,
+                const float* alpha, const float* a, const int* lda,
+                const float* b, const int* ldb,
+                const float* beta, float* c, const int* ldc);
+}
+#endif
+
 const auto base_omp_get_max_threads = omp_get_max_threads();
 
 using benchmark_clock = std::chrono::steady_clock;
+
+// Initialize data with random values in range [1.0, 2.0] to avoid denormals
+template<typename T>
+void init_random_data(T* data, size_t n) {
+    srand(42);  // Fixed seed for reproducibility
+    for (size_t i = 0; i < n; i++) {
+        data[i] = (T)(1.0 + (double)rand() / (double)RAND_MAX);
+    }
+}
 
 #ifdef BASELINE_IMPL
 
@@ -266,11 +286,18 @@ void runbench_range(double* cd, long size) {
   runbench_range<j2, Args...>(cd, size);
 }
 
-void mixbenchCPU(double* c, size_t size) {
-// Initialize data to zeros on memory by respecting 1st touch policy
+void mixbenchCPU(double* c, size_t size, bool use_zeros) {
+// Initialize data respecting 1st touch policy
 #pragma omp parallel for schedule(static)
-  for (size_t i = 0; i < size; i++)
-    c[i] = 0.0;
+  for (size_t i = 0; i < size; i++) {
+    if (use_zeros) {
+      c[i] = 0.0;
+    } else {
+      // Random data in range [1.0, 2.0] to avoid denormals
+      // Use a deterministic formula based on index for reproducibility
+      c[i] = 1.0 + (double)(i % 1000) / 1000.0;
+    }
+  }
 
   std::cout << "--------------------------------------------"
                "-------------- CSV data "
@@ -294,4 +321,70 @@ void mixbenchCPU(double* c, size_t size) {
   std::cout << "---------------------------------------------------------------"
                "---------------------------------------------------------------"
             << std::endl;
+}
+
+// GEMM benchmark using BLAS
+void runGemmBenchmark(int M, bool use_zeros) {
+#ifdef USE_BLAS
+  size_t matrix_size = (size_t)M * M * sizeof(float);
+
+  float* A = static_cast<float*>(aligned_alloc(64, matrix_size));
+  float* B = static_cast<float*>(aligned_alloc(64, matrix_size));
+  float* C = static_cast<float*>(aligned_alloc(64, matrix_size));
+
+  if (!A || !B || !C) {
+    std::cerr << "Error: Failed to allocate memory for matrices" << std::endl;
+    return;
+  }
+
+  // Initialize matrices
+  if (use_zeros) {
+    std::memset(A, 0, matrix_size);
+    std::memset(B, 0, matrix_size);
+  } else {
+    init_random_data(A, (size_t)M * M);
+    init_random_data(B, (size_t)M * M);
+  }
+  std::memset(C, 0, matrix_size);
+
+  float alpha = 1.0f, beta = 0.0f;
+  char trans = 'N';
+
+  // Warmup
+  sgemm_(&trans, &trans, &M, &M, &M, &alpha, A, &M, B, &M, &beta, C, &M);
+
+  // Print header
+  std::cout << "--------------------------------------------"
+               "-------------- CSV data "
+               "--------------------------------------------"
+               "--------------"
+            << std::endl;
+  std::cout << "matrix_size, GFLOPS, time_ms" << std::endl;
+
+  // Timed iterations
+  const int iters = 100;
+  auto start = benchmark_clock::now();
+  for (int i = 0; i < iters; i++) {
+    sgemm_(&trans, &trans, &M, &M, &M, &alpha, A, &M, B, &M, &beta, C, &M);
+  }
+  auto end = benchmark_clock::now();
+
+  double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+  double flops = 2.0 * (double)M * (double)M * (double)M * iters;
+  double gflops = flops / (ms * 1e6);
+  double avg_time = ms / iters;
+
+  std::cout << M << ", " << std::fixed << std::setprecision(2) << gflops
+            << ", " << std::setprecision(3) << avg_time << std::endl;
+
+  std::cout << "---------------------------------------------------------------"
+               "---------------------------------------------------------------"
+            << std::endl;
+
+  free(A);
+  free(B);
+  free(C);
+#else
+  std::cerr << "Error: GEMM benchmark requires BLAS. Rebuild with -DUSE_BLAS=ON" << std::endl;
+#endif
 }

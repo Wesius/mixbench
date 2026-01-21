@@ -28,6 +28,14 @@ else()
     message(FATAL_ERROR "Could not find HIP. Ensure that HIP is either installed in /opt/rocm/hip or the variable HIP_PATH is set to point to the right location.")
 endif()
 
+# Optional hipBLAS support for GEMM benchmark
+option(USE_HIPBLAS "Enable hipBLAS for GEMM benchmark" OFF)
+if(USE_HIPBLAS)
+    find_package(hipblas REQUIRED)
+    message(STATUS "Found hipBLAS - GEMM benchmark enabled")
+    add_definitions(-DUSE_HIPBLAS)
+endif()
+
 # Get version info from git tag
 execute_process(COMMAND git describe --tags --always
                 OUTPUT_VARIABLE GIT_REV
@@ -54,3 +62,7 @@ set_source_files_properties(${BENCH_SOURCE_FILES} PROPERTIES HIP_SOURCE_PROPERTY
 
 
 add_executable(mixbench-hip ${BENCH_SOURCE_FILES})
+
+if(USE_HIPBLAS)
+    target_link_libraries(mixbench-hip hip::hipblas)
+endif()

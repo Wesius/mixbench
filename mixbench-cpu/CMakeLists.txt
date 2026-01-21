@@ -18,6 +18,14 @@ find_package(OpenMP)
 
 option(BASELINE_IMPL "Use baseline implementation" OFF)
 
+# Optional BLAS support for GEMM benchmark
+option(USE_BLAS "Enable BLAS for GEMM benchmark" OFF)
+if(USE_BLAS)
+    find_package(BLAS REQUIRED)
+    message(STATUS "Found BLAS - GEMM benchmark enabled")
+    add_definitions(-DUSE_BLAS)
+endif()
+
 # Set default build type to RelWithDebInfo if not specified
 if (NOT CMAKE_BUILD_TYPE)
     message (STATUS "CMAKE_BUILD_TYPE not set. Using Release with Debug Info")
@@ -53,4 +61,8 @@ endif()
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(mixbench-cpu PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if(USE_BLAS)
+    target_link_libraries(mixbench-cpu PUBLIC ${BLAS_LIBRARIES})
 endif()

@@ -6,5 +6,5 @@
 
 #pragma once
 
-extern "C" void mixbenchGPU(double*, long size);
-
+extern "C" void mixbenchGPU(double*, long size, bool use_zeros);
+extern "C" void runGemmBenchmark(int matrix_size, bool use_zeros);

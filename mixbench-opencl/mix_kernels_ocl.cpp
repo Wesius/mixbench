@@ -279,6 +279,7 @@ extern "C" void mixbenchGPU(cl_device_id dev_id,
                             bool block_strided,
                             bool host_allocated,
                             bool use_os_timer,
+                            bool use_zeros,
                             size_t workgroupsize,
                             unsigned int elements_per_wi,
                             unsigned int fusion_degree) {
@@ -341,8 +342,17 @@ extern "C" void mixbenchGPU(cl_device_id dev_id,
       (cl_int*)clEnqueueMapBuffer(cmd_queue, c_buffer, CL_TRUE, CL_MAP_WRITE, 0,
                                   size * sizeof(double), 0, NULL, NULL, &errno);
   OCL_SAFE_CALL(errno);
-  for (int i = 0; i < size; i++)
-    mapped_data[i] = 0;
+  if (use_zeros) {
+    // Zero-initialized data (control energy mode)
+    for (int i = 0; i < size; i++)
+      mapped_data[i] = 0;
+  } else {
+    // Random data in range [1.0, 2.0] to avoid denormals
+    // Use deterministic formula for reproducibility
+    float* float_data = reinterpret_cast<float*>(mapped_data);
+    for (int i = 0; i < size * 2; i++)  // size doubles = 2*size floats
+      float_data[i] = 1.0f + (float)(i % 1000) / 1000.0f;
+  }
   clEnqueueUnmapMemObject(cmd_queue, c_buffer, mapped_data, 0, NULL, NULL);
 
   // Load source, create program and all kernels

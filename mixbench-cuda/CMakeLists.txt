@@ -21,7 +21,12 @@ file(WRITE "version_info.h" "#define VERSION_INFO \"")
 file(APPEND "version_info.h" ${GIT_REV})
 file(APPEND "version_info.h" "\"")
 
+# Find cuBLAS
+find_package(CUDAToolkit REQUIRED)
+
 add_executable(mixbench-cuda main-cuda.cpp mix_kernels_cuda.h lcutil.h version_info.h mix_kernels_cuda.cu mix_kernels_cuda.h lcutil.h)
 
 target_compile_features(mixbench-cuda PUBLIC cxx_std_11)
 
+# Link cuBLAS
+target_link_libraries(mixbench-cuda CUDA::cublas)

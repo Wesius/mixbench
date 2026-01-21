@@ -18,6 +18,10 @@
 #define GPU_INF(_T) std::numeric_limits<_T>::infinity()
 #endif
 
+#ifdef USE_HIPBLAS
+#include <hipblas/hipblas.h>
+#endif
+
 typedef __half2 half2;
 
 #include <common.h>
@@ -94,6 +98,15 @@ float finalizeEvents_ext(hipEvent_t start, hipEvent_t stop) {
   HIP_SAFE_CALL(hipEventDestroy(start));
   HIP_SAFE_CALL(hipEventDestroy(stop));
   return kernel_time;
+}
+
+// Initialize host data with random values in range [1.0, 2.0] to avoid denormals
+template<typename T>
+void init_random_data(T* data, size_t n) {
+  srand(42);  // Fixed seed for reproducibility
+  for (size_t i = 0; i < n; i++) {
+    data[i] = (T)(1.0 + (double)rand() / (double)RAND_MAX);
+  }
 }
 
 void runbench_warmup(double* cd, long size) {
@@ -219,7 +232,7 @@ void runbench(double* cd, long size) {
           (1000. * 1000. * 1000.));
 }
 
-extern "C" void mixbenchGPU(double* c, long size) {
+extern "C" void mixbenchGPU(double* c, long size, bool use_zeros) {
   const char* benchtype = "compute with global memory (block strided)";
 
   printf("Trade-off type:       %s\n", benchtype);
@@ -229,9 +242,14 @@ extern "C" void mixbenchGPU(double* c, long size) {
 
   HIP_SAFE_CALL(hipMalloc((void**)&cd, size * sizeof(double)));
 
-  // Copy data to device memory
-  HIP_SAFE_CALL(
-      hipMemset(cd, 0, size * sizeof(double)));  // initialize to zeros
+  if (use_zeros) {
+    // Initialize to zeros (control energy mode)
+    HIP_SAFE_CALL(hipMemset(cd, 0, size * sizeof(double)));
+  } else {
+    // Initialize with random data in range [1.0, 2.0] to avoid denormals
+    // Data should already be initialized in c by caller
+    HIP_SAFE_CALL(hipMemcpy(cd, c, size * sizeof(double), hipMemcpyHostToDevice));
+  }
 
   // Synchronize in order to wait for memory operations to finish
   HIP_SAFE_CALL(hipDeviceSynchronize());
@@ -298,4 +316,105 @@ extern "C" void mixbenchGPU(double* c, long size) {
   HIP_SAFE_CALL(hipFree(cd));
 
   HIP_SAFE_CALL(hipDeviceReset());
+}
+
+// GEMM benchmark using hipBLAS
+extern "C" void runGemmBenchmark(int M, bool use_zeros) {
+#ifdef USE_HIPBLAS
+  hipblasHandle_t handle;
+  hipblasStatus_t status;
+
+  status = hipblasCreate(&handle);
+  if (status != HIPBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "Error: hipBLAS initialization failed\n");
+    return;
+  }
+
+  // Allocate device memory
+  float *d_A, *d_B, *d_C;
+  size_t matrix_size = (size_t)M * M * sizeof(float);
+
+  HIP_SAFE_CALL(hipMalloc(&d_A, matrix_size));
+  HIP_SAFE_CALL(hipMalloc(&d_B, matrix_size));
+  HIP_SAFE_CALL(hipMalloc(&d_C, matrix_size));
+
+  if (use_zeros) {
+    // Zero-initialized data (control energy mode)
+    HIP_SAFE_CALL(hipMemset(d_A, 0, matrix_size));
+    HIP_SAFE_CALL(hipMemset(d_B, 0, matrix_size));
+  } else {
+    // Random data in range [1.0, 2.0]
+    float* h_A = (float*)malloc(matrix_size);
+    float* h_B = (float*)malloc(matrix_size);
+    init_random_data(h_A, (size_t)M * M);
+    init_random_data(h_B, (size_t)M * M);
+    HIP_SAFE_CALL(hipMemcpy(d_A, h_A, matrix_size, hipMemcpyHostToDevice));
+    HIP_SAFE_CALL(hipMemcpy(d_B, h_B, matrix_size, hipMemcpyHostToDevice));
+    free(h_A);
+    free(h_B);
+  }
+  HIP_SAFE_CALL(hipMemset(d_C, 0, matrix_size));
+
+  float alpha = 1.0f, beta = 0.0f;
+
+  // Warmup
+  status = hipblasSgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+                        M, M, M, &alpha, d_A, M, d_B, M, &beta, d_C, M);
+  if (status != HIPBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "Error: hipBLAS SGEMM failed\n");
+    goto cleanup;
+  }
+  HIP_SAFE_CALL(hipDeviceSynchronize());
+
+  // Print header
+  printf(
+      "------------------------------------------------------------------------"
+      "----- CSV data "
+      "------------------------------------------------------------------------"
+      "-------------------------------------------\n");
+  printf("matrix_size, GFLOPS, time_ms\n");
+
+  // Timed iterations
+  {
+    hipEvent_t start, stop;
+    HIP_SAFE_CALL(hipEventCreate(&start));
+    HIP_SAFE_CALL(hipEventCreate(&stop));
+
+    const int iters = 100;
+    HIP_SAFE_CALL(hipEventRecord(start));
+    for (int i = 0; i < iters; i++) {
+      hipblasSgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+                   M, M, M, &alpha, d_A, M, d_B, M, &beta, d_C, M);
+    }
+    HIP_SAFE_CALL(hipEventRecord(stop));
+    HIP_SAFE_CALL(hipEventSynchronize(stop));
+
+    float ms;
+    HIP_SAFE_CALL(hipEventElapsedTime(&ms, start, stop));
+
+    double flops = 2.0 * (double)M * (double)M * (double)M * iters;
+    double gflops = flops / (ms * 1e6);
+    double avg_time = ms / iters;
+
+    printf("%d, %.2f, %.3f\n", M, gflops, avg_time);
+
+    HIP_SAFE_CALL(hipEventDestroy(start));
+    HIP_SAFE_CALL(hipEventDestroy(stop));
+  }
+
+  printf(
+      "------------------------------------------------------------------------"
+      "------------------------------------------------------------------------"
+      "----------------------------------------------------------\n");
+
+cleanup:
+  HIP_SAFE_CALL(hipFree(d_A));
+  HIP_SAFE_CALL(hipFree(d_B));
+  HIP_SAFE_CALL(hipFree(d_C));
+  hipblasDestroy(handle);
+
+  HIP_SAFE_CALL(hipDeviceReset());
+#else
+  fprintf(stderr, "Error: GEMM benchmark requires hipBLAS. Rebuild with -DUSE_HIPBLAS=ON\n");
+#endif
 }

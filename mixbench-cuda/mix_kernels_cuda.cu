@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <math.h>
+#include <cublas_v2.h>
 #include "lcutil.h"
 
 #define ELEMENTS_PER_THREAD (8)
@@ -87,6 +88,15 @@ float finalizeEvents(cudaEvent_t start, cudaEvent_t stop){
 	return kernel_time;
 }
 
+// Initialize host data with random values in range [1.0, 2.0] to avoid denormals
+template<typename T>
+void init_random_data(T* data, size_t n) {
+	srand(42);  // Fixed seed for reproducibility
+	for (size_t i = 0; i < n; i++) {
+		data[i] = (T)(1.0 + (double)rand() / (double)RAND_MAX);
+	}
+}
+
 void runbench_warmup(double *cd, long size){
 	const long reduced_grid_size = size/(ELEMENTS_PER_THREAD)/128;
 	const int BLOCK_SIZE = 256;
@@ -155,7 +165,7 @@ void runbench(double *cd, long size, bool doHalfs){
 		((double)memoryoperations*sizeof(int))/kernel_time_mad_int*1000./(1000.*1000.*1000.) );
 }
 
-extern "C" void mixbenchGPU(double *c, long size){
+extern "C" void mixbenchGPU(double *c, long size, bool use_zeros){
 	const char *benchtype = "compute with global memory (block strided)";
 
 	printf("Trade-off type:       %s\n", benchtype);
@@ -168,8 +178,14 @@ extern "C" void mixbenchGPU(double *c, long size){
 
 	CUDA_SAFE_CALL( cudaMalloc((void**)&cd, size*sizeof(double)) );
 
-	// Copy data to device memory
-	CUDA_SAFE_CALL( cudaMemset(cd, 0, size*sizeof(double)) );  // initialize to zeros
+	if (use_zeros) {
+		// Initialize to zeros (control energy mode)
+		CUDA_SAFE_CALL( cudaMemset(cd, 0, size*sizeof(double)) );
+	} else {
+		// Initialize with random data in range [1.0, 2.0] to avoid denormals
+		init_random_data(c, size);
+		CUDA_SAFE_CALL( cudaMemcpy(cd, c, size*sizeof(double), cudaMemcpyHostToDevice) );
+	}
 
 	// Synchronize in order to wait for memory operations to finish
 	CUDA_SAFE_CALL( cudaDeviceSynchronize() );
@@ -222,6 +238,96 @@ extern "C" void mixbenchGPU(double *c, long size){
 	CUDA_SAFE_CALL( cudaMemcpy(c, cd, size*sizeof(double), cudaMemcpyDeviceToHost) );
 
 	CUDA_SAFE_CALL( cudaFree(cd) );
+
+	CUDA_SAFE_CALL( cudaDeviceReset() );
+}
+
+// GEMM benchmark using cuBLAS
+extern "C" void runGemmBenchmark(int M, bool use_zeros) {
+	cublasHandle_t handle;
+	cublasStatus_t status;
+
+	status = cublasCreate(&handle);
+	if (status != CUBLAS_STATUS_SUCCESS) {
+		fprintf(stderr, "Error: cuBLAS initialization failed\n");
+		return;
+	}
+
+	// Allocate device memory
+	float *d_A, *d_B, *d_C;
+	size_t matrix_size = (size_t)M * M * sizeof(float);
+
+	CUDA_SAFE_CALL( cudaMalloc(&d_A, matrix_size) );
+	CUDA_SAFE_CALL( cudaMalloc(&d_B, matrix_size) );
+	CUDA_SAFE_CALL( cudaMalloc(&d_C, matrix_size) );
+
+	if (use_zeros) {
+		// Zero-initialized data (control energy mode)
+		CUDA_SAFE_CALL( cudaMemset(d_A, 0, matrix_size) );
+		CUDA_SAFE_CALL( cudaMemset(d_B, 0, matrix_size) );
+	} else {
+		// Random data in range [1.0, 2.0]
+		float* h_A = (float*)malloc(matrix_size);
+		float* h_B = (float*)malloc(matrix_size);
+		init_random_data(h_A, (size_t)M * M);
+		init_random_data(h_B, (size_t)M * M);
+		CUDA_SAFE_CALL( cudaMemcpy(d_A, h_A, matrix_size, cudaMemcpyHostToDevice) );
+		CUDA_SAFE_CALL( cudaMemcpy(d_B, h_B, matrix_size, cudaMemcpyHostToDevice) );
+		free(h_A);
+		free(h_B);
+	}
+	CUDA_SAFE_CALL( cudaMemset(d_C, 0, matrix_size) );
+
+	float alpha = 1.0f, beta = 0.0f;
+
+	// Warmup
+	status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+	                     M, M, M, &alpha, d_A, M, d_B, M, &beta, d_C, M);
+	if (status != CUBLAS_STATUS_SUCCESS) {
+		fprintf(stderr, "Error: cuBLAS SGEMM failed\n");
+		goto cleanup;
+	}
+	CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+
+	// Print header
+	printf("----------------------------------------------------------------------------- CSV data -----------------------------------------------------------------------------\n");
+	printf("matrix_size, GFLOPS, time_ms\n");
+
+	// Timed iterations
+	{
+		cudaEvent_t start, stop;
+		CUDA_SAFE_CALL( cudaEventCreate(&start) );
+		CUDA_SAFE_CALL( cudaEventCreate(&stop) );
+
+		const int iters = 100;
+		CUDA_SAFE_CALL( cudaEventRecord(start) );
+		for (int i = 0; i < iters; i++) {
+			cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+			            M, M, M, &alpha, d_A, M, d_B, M, &beta, d_C, M);
+		}
+		CUDA_SAFE_CALL( cudaEventRecord(stop) );
+		CUDA_SAFE_CALL( cudaEventSynchronize(stop) );
+
+		float ms;
+		CUDA_SAFE_CALL( cudaEventElapsedTime(&ms, start, stop) );
+
+		double flops = 2.0 * (double)M * (double)M * (double)M * iters;
+		double gflops = flops / (ms * 1e6);
+		double avg_time = ms / iters;
+
+		printf("%d, %.2f, %.3f\n", M, gflops, avg_time);
+
+		CUDA_SAFE_CALL( cudaEventDestroy(start) );
+		CUDA_SAFE_CALL( cudaEventDestroy(stop) );
+	}
+
+	printf("--------------------------------------------------------------------------------------------------------------------------------------------------------------------\n");
+
+cleanup:
+	CUDA_SAFE_CALL( cudaFree(d_A) );
+	CUDA_SAFE_CALL( cudaFree(d_B) );
+	CUDA_SAFE_CALL( cudaFree(d_C) );
+	cublasDestroy(handle);
 
 	CUDA_SAFE_CALL( cudaDeviceReset() );
 }
