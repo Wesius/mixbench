@@ -9,8 +9,16 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <math.h>
+#include <sys/time.h>
 #include <cublas_v2.h>
 #include "lcutil.h"
+
+// Get current Unix timestamp in seconds with microsecond precision
+static double get_timestamp() {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
 
 #define ELEMENTS_PER_THREAD (8)
 #define FUSION_DEGREE (4)
@@ -112,6 +120,9 @@ void runbench_warmup(double *cd, long size){
 
 int out_config = 1;
 
+// Global duration setting for sustained workloads
+static float g_duration_per_point = 0.0f;
+
 template<unsigned int compute_iterations>
 void runbench(double *cd, long size, bool doHalfs){
 	const long compute_grid_size = size/ELEMENTS_PER_THREAD/FUSION_DEGREE;
@@ -124,48 +135,144 @@ void runbench(double *cd, long size, bool doHalfs){
 	dim3 dimGrid(TOTAL_BLOCKS, 1, 1);
 	cudaEvent_t start, stop;
 
+	// Determine number of iterations based on duration_per_point
+	// If duration_per_point > 0, run repeatedly until duration is reached
+	int iterations = 1;
+	float target_duration_ms = g_duration_per_point * 1000.0f;
+
+	// Single precision
 	initializeEvents(&start, &stop);
 	benchmark_func< float, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(1.0f, (float*)cd);
 	float kernel_time_mad_sp = finalizeEvents(start, stop);
+	int sp_iterations = 1;
+	double sp_start_ts = 0, sp_end_ts = 0;
 
+	if (target_duration_ms > 0 && kernel_time_mad_sp > 0) {
+		sp_iterations = (int)(target_duration_ms / kernel_time_mad_sp) + 1;
+		// Always run sustained workload in duration mode (minimum 2 iterations)
+		sp_iterations = sp_iterations < 2 ? 2 : sp_iterations;
+		sp_start_ts = get_timestamp();
+		initializeEvents(&start, &stop);
+		for (int i = 0; i < sp_iterations; i++) {
+			benchmark_func< float, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(1.0f, (float*)cd);
+		}
+		// Report total time for power measurement, not average
+		kernel_time_mad_sp = finalizeEvents(start, stop);
+		sp_end_ts = get_timestamp();
+	}
+
+	// Double precision
 	initializeEvents(&start, &stop);
 	benchmark_func< double, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(1.0, cd);
 	float kernel_time_mad_dp = finalizeEvents(start, stop);
+	int dp_iterations = 1;
+	double dp_start_ts = 0, dp_end_ts = 0;
 
+	if (target_duration_ms > 0 && kernel_time_mad_dp > 0) {
+		dp_iterations = (int)(target_duration_ms / kernel_time_mad_dp) + 1;
+		dp_iterations = dp_iterations < 2 ? 2 : dp_iterations;
+		dp_start_ts = get_timestamp();
+		initializeEvents(&start, &stop);
+		for (int i = 0; i < dp_iterations; i++) {
+			benchmark_func< double, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(1.0, cd);
+		}
+		// Report total time for power measurement, not average
+		kernel_time_mad_dp = finalizeEvents(start, stop);
+		dp_end_ts = get_timestamp();
+	}
+
+	// Half precision
 	float kernel_time_mad_hp = 0.f;
+	int hp_iterations = 1;
+	double hp_start_ts = 0, hp_end_ts = 0;
 	if( doHalfs ){
 		initializeEvents(&start, &stop);
 		half2 h_ones;
 		*((int32_t*)&h_ones) = 15360 + (15360 << 16); // 1.0 as half
 		benchmark_func< half2, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(h_ones, (half2*)cd);
 		kernel_time_mad_hp = finalizeEvents(start, stop);
+
+		if (target_duration_ms > 0 && kernel_time_mad_hp > 0) {
+			hp_iterations = (int)(target_duration_ms / kernel_time_mad_hp) + 1;
+			hp_iterations = hp_iterations < 2 ? 2 : hp_iterations;
+			hp_start_ts = get_timestamp();
+			initializeEvents(&start, &stop);
+			for (int i = 0; i < hp_iterations; i++) {
+				benchmark_func< half2, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, false ><<< dimGrid, dimBlock >>>(h_ones, (half2*)cd);
+			}
+			// Report total time for power measurement, not average
+			kernel_time_mad_hp = finalizeEvents(start, stop);
+			hp_end_ts = get_timestamp();
+		}
 	}
 
+	// Integer
 	initializeEvents(&start, &stop);
 	benchmark_func< int, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, true ><<< dimGrid, dimBlock >>>(1, (int*)cd);
 	float kernel_time_mad_int = finalizeEvents(start, stop);
+	int int_iterations = 1;
+	double int_start_ts = 0, int_end_ts = 0;
+
+	if (target_duration_ms > 0 && kernel_time_mad_int > 0) {
+		int_iterations = (int)(target_duration_ms / kernel_time_mad_int) + 1;
+		int_iterations = int_iterations < 2 ? 2 : int_iterations;
+		int_start_ts = get_timestamp();
+		initializeEvents(&start, &stop);
+		for (int i = 0; i < int_iterations; i++) {
+			benchmark_func< int, BLOCK_SIZE, ELEMENTS_PER_THREAD, FUSION_DEGREE, compute_iterations, true ><<< dimGrid, dimBlock >>>(1, (int*)cd);
+		}
+		// Report total time for power measurement, not average
+		kernel_time_mad_int = finalizeEvents(start, stop);
+		int_end_ts = get_timestamp();
+	}
+
+	// When using duration mode, scale computations and memory by iterations
+	// to get correct GFLOPS and GB/s for total work done
+	long long sp_computations = computations * sp_iterations;
+	long long dp_computations = computations * dp_iterations;
+	long long hp_computations = (long long)2 * computations * hp_iterations;
+	long long int_computations = computations * int_iterations;
+	long long sp_memory = memoryoperations * sp_iterations;
+	long long dp_memory = memoryoperations * dp_iterations;
+	long long hp_memory = memoryoperations * hp_iterations;
+	long long int_memory = memoryoperations * int_iterations;
 
 	printf("         %4d,   %8.3f,%8.2f,%8.2f,%7.2f,   %8.3f,%8.2f,%8.2f,%7.2f,   %8.3f,%8.2f,%8.2f,%7.2f,  %8.3f,%8.2f,%8.2f,%7.2f\n",
 		compute_iterations,
-		((double)computations)/((double)memoryoperations*sizeof(float)),
+		((double)computations)/((double)memoryoperations*sizeof(float)),  // AI is same regardless of iterations
 		kernel_time_mad_sp,
-		((double)computations)/kernel_time_mad_sp*1000./(double)(1000*1000*1000),
-		((double)memoryoperations*sizeof(float))/kernel_time_mad_sp*1000./(1000.*1000.*1000.),
+		((double)sp_computations)/kernel_time_mad_sp*1000./(double)(1000*1000*1000),
+		((double)sp_memory*sizeof(float))/kernel_time_mad_sp*1000./(1000.*1000.*1000.),
 		((double)computations)/((double)memoryoperations*sizeof(double)),
 		kernel_time_mad_dp,
-		((double)computations)/kernel_time_mad_dp*1000./(double)(1000*1000*1000),
-		((double)memoryoperations*sizeof(double))/kernel_time_mad_dp*1000./(1000.*1000.*1000.),
+		((double)dp_computations)/kernel_time_mad_dp*1000./(double)(1000*1000*1000),
+		((double)dp_memory*sizeof(double))/kernel_time_mad_dp*1000./(1000.*1000.*1000.),
 		((double)2*computations)/((double)memoryoperations*sizeof(half2)),
 		kernel_time_mad_hp,
-		((double)2*computations)/kernel_time_mad_hp*1000./(double)(1000*1000*1000),
-		((double)memoryoperations*sizeof(half2))/kernel_time_mad_hp*1000./(1000.*1000.*1000.),
+		((double)hp_computations)/kernel_time_mad_hp*1000./(double)(1000*1000*1000),
+		((double)hp_memory*sizeof(half2))/kernel_time_mad_hp*1000./(1000.*1000.*1000.),
 		((double)computations)/((double)memoryoperations*sizeof(int)),
 		kernel_time_mad_int,
-		((double)computations)/kernel_time_mad_int*1000./(double)(1000*1000*1000),
-		((double)memoryoperations*sizeof(int))/kernel_time_mad_int*1000./(1000.*1000.*1000.) );
+		((double)int_computations)/kernel_time_mad_int*1000./(double)(1000*1000*1000),
+		((double)int_memory*sizeof(int))/kernel_time_mad_int*1000./(1000.*1000.*1000.) );
+
+	// Output timestamps for power correlation (only in duration mode)
+	if (g_duration_per_point > 0) {
+		printf("# TS:%d,sp,%.6f,%.6f,dp,%.6f,%.6f,hp,%.6f,%.6f,int,%.6f,%.6f\n",
+			compute_iterations,
+			sp_start_ts, sp_end_ts,
+			dp_start_ts, dp_end_ts,
+			hp_start_ts, hp_end_ts,
+			int_start_ts, int_end_ts);
+		fflush(stdout);  // Ensure timestamps are output immediately
+	}
 }
 
-extern "C" void mixbenchGPU(double *c, long size, bool use_zeros){
+extern "C" void mixbenchGPU(double *c, long size, bool use_zeros, float duration_per_point){
+	g_duration_per_point = duration_per_point;
+	if (duration_per_point > 0) {
+		printf("# Sustained duration per AI point: %.1f seconds\n", duration_per_point);
+	}
 	const char *benchtype = "compute with global memory (block strided)";
 
 	printf("Trade-off type:       %s\n", benchtype);

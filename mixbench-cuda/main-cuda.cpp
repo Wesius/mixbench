@@ -20,6 +20,7 @@ typedef struct {
     bool use_zeros;
     bool run_gemm;
     int matrix_size;
+    float duration_per_point;  // Duration in seconds per AI point (0 = single run)
 } ArgParams;
 
 void print_usage(const char* program_name) {
@@ -29,6 +30,8 @@ void print_usage(const char* program_name) {
     printf("  -z, --zeros         Use zero-initialized data (control energy mode)\n");
     printf("  --gemm              Run GEMM benchmark instead of compute sweep\n");
     printf("  --matrix-size N     Matrix size for GEMM (default: 4096)\n");
+    printf("  --duration S        Duration in seconds per AI point for power measurement\n");
+    printf("                      (default: 0 = single run, recommended: 5.0 for energy characterization)\n");
     printf("\n");
     printf("Arguments:\n");
     printf("  device_index        CUDA device index (default: 0)\n");
@@ -39,6 +42,7 @@ bool parse_arguments(int argc, char* argv[], ArgParams* params) {
     params->use_zeros = false;
     params->run_gemm = false;
     params->matrix_size = 4096;
+    params->duration_per_point = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -56,6 +60,17 @@ bool parse_arguments(int argc, char* argv[], ArgParams* params) {
                 }
             } else {
                 fprintf(stderr, "Error: --matrix-size requires an argument\n");
+                return false;
+            }
+        } else if (strcmp(argv[i], "--duration") == 0) {
+            if (i + 1 < argc) {
+                params->duration_per_point = atof(argv[++i]);
+                if (params->duration_per_point < 0) {
+                    fprintf(stderr, "Error: Invalid duration\n");
+                    return false;
+                }
+            } else {
+                fprintf(stderr, "Error: --duration requires an argument\n");
                 return false;
             }
         } else if (argv[i][0] != '-') {
@@ -99,7 +114,7 @@ int main(int argc, char* argv[]) {
     if (params.run_gemm) {
         runGemmBenchmark(params.matrix_size, params.use_zeros);
     } else {
-        mixbenchGPU(c, VECTOR_SIZE, params.use_zeros);
+        mixbenchGPU(c, VECTOR_SIZE, params.use_zeros, params.duration_per_point);
     }
 
     free(c);
